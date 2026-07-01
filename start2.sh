@@ -1,61 +1,104 @@
 #!/bin/bash
+set -e
 
-if [ ! -d "Fooocus" ]; then
-  git clone https://github.com/estebencalcina/Fooocus.git
-fi
+# Carpeta desde la que ejecutas: /content/Fooocus-cola
+BASE_DIR="$(pwd)"
+FOOOCUS_DIR="$BASE_DIR/Fooocus"
+ENV_DIR="/tmp/fooocus"
 
-cd Fooocus
-git pull
+# Cargar Conda correctamente, sin depender de ~/.conda/envs
+source "$(conda info --base)/etc/profile.d/conda.sh"
 
-if [ ! -L ~/.conda/envs/fooocus ]; then
-    ln -s /tmp/fooocus ~/.conda/envs/
-fi
-
-eval "$(conda shell.bash hook)"
-
-if [ ! -d /tmp/fooocus ]; then
-    mkdir /tmp/fooocus
-    conda env create -f environment.yaml
-    conda activate fooocus
-    pip install -r requirements_versions.txt
-    pip install torch torchvision --force-reinstall --index-url https://download.pytorch.org/whl/cu117
-    conda install glib -y
-    rm -rf ~/.cache/pip
-fi
-
-# Setup the path for model checkpoints
-current_folder=$(pwd)
-model_folder=${current_folder}/models/checkpoints-real-folder
-if [ ! -e config.txt ]; then
-  json_data="{ \"path_checkpoints\": \"$model_folder\" }"
-  echo "$json_data" > config.txt
-  echo "JSON file created: config.txt"
+# Descargar o actualizar Fooocus
+if [ ! -d "$FOOOCUS_DIR" ]; then
+  git clone https://github.com/estebencalcina/Fooocus.git "$FOOOCUS_DIR"
 else
-  echo "Updating config.txt to use checkpoints-real-folder"
-  jq --arg new_value "$model_folder" '.path_checkpoints = $new_value' config.txt > config_tmp.txt && mv config_tmp.txt config.txt
+  cd "$FOOOCUS_DIR"
+  git pull
+  cd "$BASE_DIR"
 fi
 
-# If the checkpoints folder exists, move it to the new checkpoints-real-folder
+cd "$FOOOCUS_DIR"
+
+# Crear el entorno aislado solo la primera vez
+if [ ! -x "$ENV_DIR/bin/python" ]; then
+  echo "Creando entorno Conda para Fooocus..."
+  conda env create --prefix "$ENV_DIR" -f environment.yaml
+fi
+
+# Activar SIEMPRE el entorno correcto
+conda activate "$ENV_DIR"
+
+# Instalar dependencias de Fooocus dentro del entorno, no en el Python global de Colab
+pip install --no-cache-dir -r requirements_versions.txt
+
+# Versiones compatibles: evita el error NumPy/CuPy
+pip uninstall -y numpy cupy cupy-cuda11x cupy-cuda12x || true
+pip install --no-cache-dir --force-reinstall \
+  numpy==1.26.4 \
+  cupy-cuda12x==13.6.0
+
+# Evita el error: TypeError: unhashable type: 'dict'
+pip install --no-cache-dir --force-reinstall \
+  gradio==3.41.2 \
+  fastapi==0.103.2 \
+  starlette==0.27.0 \
+  jinja2==3.1.2
+
+# Configurar la carpeta de modelos
+MODEL_FOLDER="$FOOOCUS_DIR/models/checkpoints-real-folder"
+
+if [ ! -f config.txt ]; then
+  echo "{ \"path_checkpoints\": \"$MODEL_FOLDER\" }" > config.txt
+else
+  jq --arg new_value "$MODEL_FOLDER" \
+    '.path_checkpoints = $new_value' config.txt > config_tmp.txt \
+    && mv config_tmp.txt config.txt
+fi
+
+# Crear la carpeta de checkpoints si todavía no existe
+if [ ! -d models/checkpoints-real-folder ]; then
+  mkdir -p models/checkpoints-real-folder
+fi
+
+# Mantener el enlace usado por Fooocus
 if [ ! -L models/checkpoints ]; then
-    mv models/checkpoints models/checkpoints-real-folder
-    ln -s models/checkpoints-real-folder models/checkpoints
+  rm -rf models/checkpoints
+  ln -s models/checkpoints-real-folder models/checkpoints
 fi
 
-# Activate the fooocus environment
-conda activate fooocus
-cd ..
+# Detener instancias previas, por si las hubiera
+pkill -f "entry_with_update.py" || true
+pkill -f "cloudflared tunnel --url.*7865" || true
 
-# Run Python script in the background
-python Fooocus/entry_with_update.py --always-high-vram &
+# Iniciar Fooocus
+echo "Iniciando Fooocus..."
+nohup python entry_with_update.py \
+  --listen \
+  --share \
+  --always-high-vram \
+  > /content/fooocus.log 2>&1 &
 
-sleep 120
+# Esperar a que Fooocus esté disponible, en vez de esperar 120 segundos sin comprobar nada
+echo "Esperando a Fooocus..."
+for i in {1..90}; do
+  if curl -s http://127.0.0.1:7865/ > /dev/null; then
+    echo "Fooocus ya está activo."
+    break
+  fi
 
-# Run cloudflared tunnel
-cloudflared tunnel --url localhost:7865
+  if ! pgrep -f "entry_with_update.py" > /dev/null; then
+    echo "Fooocus se cerró. Últimas líneas del registro:"
+    tail -n 60 /content/fooocus.log
+    exit 1
+  fi
 
-# Check if the script was called with the "reset" argument
-if [ $# -eq 0 ]; then
-  sh cloudflare.sh
-elif [ $1 = "reset" ]; then
-  sh cloudflare.sh
-fi
+  sleep 2
+done
+
+# Mostrar las últimas líneas para ver el enlace de Gradio, si se generó
+tail -n 30 /content/fooocus.log
+
+# Crear el túnel Cloudflare para Fooocus
+echo "Creando túnel Cloudflare para Fooocus..."
+cloudflared tunnel --url http://127.0.0.1:7865
